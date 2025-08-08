@@ -46,7 +46,7 @@ class ReasoningAgent(ReasoningLLM):
 
     MAX_ACTIONS = 400
     DO_OBSERVATION = True
-    MODEL = "o4-mini"
+    MODEL = "gpt-5"
     MESSAGE_LIMIT = 5
     REASONING_EFFORT = "high"
     ZONE_SIZE = 16
@@ -157,16 +157,15 @@ class ReasoningAgent(ReasoningLLM):
         img.save(buffer, format="PNG")
         return buffer.getvalue()
 
-    def build_functions(self) -> list[dict[str, Any]]:
-        """Build JSON function description of game actions for LLM."""
+    def build_tools(self) -> list[dict[str, Any]]:
+        """Build Responses-native tool descriptors with ReasoningActionResponse schema."""
         schema = ReasoningActionResponse.model_json_schema()
-        # The 'name' property is the action to be taken, so we can remove it from the parameters.
         schema["properties"].pop("name", None)
-        if "required" in schema:
+        if "required" in schema and "name" in schema["required"]:
             schema["required"].remove("name")
-
-        functions: list[dict[str, Any]] = [
+        return [
             {
+                "type": "function",
                 "name": action.name,
                 "description": f"Take action {action.name}",
                 "parameters": schema,
@@ -179,24 +178,6 @@ class ReasoningAgent(ReasoningLLM):
                 GameAction.RESET,
             ]
         ]
-        return functions
-
-    def build_tools(self) -> list[dict[str, Any]]:
-        """Support models that expect tool_call format."""
-        functions = self.build_functions()
-        tools: list[dict[str, Any]] = []
-        for f in functions:
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": f["name"],
-                        "description": f["description"],
-                        "parameters": f.get("parameters", {}),
-                    },
-                }
-            )
-        return tools
 
     def build_user_prompt(self, latest_frame: FrameData) -> str:
         """Build the user prompt for hypothesis-driven exploration."""
@@ -249,29 +230,36 @@ Hint:
     ) -> ReasoningActionResponse:
         """Call LLM with structured output parsing for reasoning agent."""
         try:
-            tools = self.build_tools()
-
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.MODEL,
-                messages=messages,
-                tools=tools,
+                input=messages,
+                tools=self.build_tools(),
                 tool_choice="required",
+                reasoning={"effort": getattr(self, "REASONING_EFFORT", None)}
+                if getattr(self, "REASONING_EFFORT", None)
+                else None,
             )
 
-            self.track_tokens(
-                response.usage.total_tokens, response.choices[0].message.content
-            )
+            # Token and reasoning tracking (Responses API)
+            assistant_text = getattr(response, "output_text", None) or ""
+            self.track_tokens(response.usage.total_tokens, assistant_text)
             self.capture_reasoning_from_response(response)
 
-            response_message = response.choices[0].message
-            tool_calls = response_message.tool_calls
-            if tool_calls:
-                tool_call = tool_calls[0]
-                function_args = json.loads(tool_call.function.arguments)
-                function_args["name"] = tool_call.function.name
-                return ReasoningActionResponse(**function_args)
+            # Find first function_call
+            tool_call_item = None
+            for item in getattr(response, "output", []) or []:
+                if getattr(item, "type", None) == "function_call":
+                    tool_call_item = item
+                    break
 
-            raise ValueError("LLM did not return a tool call.")
+            if tool_call_item is None:
+                raise ValueError("LLM did not return a tool call.")
+
+            arguments_json = getattr(tool_call_item, "arguments", "{}")
+            name = getattr(tool_call_item, "name", "RESET")
+            function_args = json.loads(arguments_json or "{}")
+            function_args["name"] = name
+            return ReasoningActionResponse(**function_args)
 
         except Exception as e:
             logger.error(f"LLM structured call failed: {e}")
@@ -298,13 +286,10 @@ Hint:
         if previous_screen:
             user_message_content.extend(
                 [
-                    {"type": "text", "text": "Previous screen:"},
+                    {"type": "input_text", "text": "Previous screen:"},
                     {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{base64.b64encode(previous_screen).decode()}",
-                            "detail": "high",
-                        },
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{base64.b64encode(previous_screen).decode()}",
                     },
                 ]
             )
@@ -315,20 +300,20 @@ Hint:
         current_image_b64 = base64.b64encode(map_image).decode()
         user_message_content.extend(
             [
-                {"type": "text", "text": user_message_text},
+                {"type": "input_text", "text": user_message_text},
                 {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{current_image_b64}",
-                        "detail": "high",
-                    },
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{current_image_b64}",
                 },
             ]
         )
 
         # Build messages
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
             {"role": "user", "content": user_message_content},
         ]
 

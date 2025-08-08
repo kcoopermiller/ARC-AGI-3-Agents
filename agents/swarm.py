@@ -66,7 +66,7 @@ class Swarm:
         else:
             self.tags.extend(["agent", self.agent_name])
 
-    def main(self) -> Scorecard:
+    def main(self) -> Optional[Scorecard]:
         """The main orchestration loop, continues until all agents are done."""
 
         # submit start of scorecard
@@ -133,7 +133,15 @@ class Swarm:
                 f"API error during open scorecard: {r.status_code} - {response_data}"
             )
 
-        return response_data["card_id"]
+        if isinstance(response_data, dict) and "error" in response_data:
+            logger.warning(f"Exception during open scorecard request: {response_data}")
+
+        card_id = response_data.get("card_id")
+        if not isinstance(card_id, str):
+            raise Exception(
+                f"Invalid response from open scorecard: {r.status_code} - {response_data}"
+            )
+        return card_id
 
     def close_scorecard(self, card_id: str) -> Optional[Scorecard]:
         self.card_id = None
@@ -154,6 +162,10 @@ class Swarm:
             logger.warning(
                 f"API error during close scorecard: {r.status_code} - {response_data}"
             )
+            return None
+
+        if isinstance(response_data, dict) and "error" in response_data:
+            logger.warning(f"Exception during close scorecard request: {response_data}")
             return None
 
         return Scorecard.model_validate(response_data)

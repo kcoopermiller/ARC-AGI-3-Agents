@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 import openai
 from openai import OpenAI as OpenAIClient
+from openai.types.responses import ResponseInputParam
 
 from ..agent import Agent
 from ..structs import FrameData, GameAction, GameState
@@ -16,30 +17,27 @@ logger = logging.getLogger()
 class LLM(Agent):
     """An agent that uses a base LLM model to play games."""
 
-    MAX_ACTIONS: int = 80
+    MAX_ACTIONS: int = 10
     DO_OBSERVATION: bool = True
-    REASONING_EFFORT: Optional[str] = None
-    MODEL_REQUIRES_TOOLS: bool = False
-
+    REASONING_EFFORT: Optional[str] = "high"
     MESSAGE_LIMIT: int = 10
-    MODEL: str = "gpt-4o-mini"
-    messages: list[dict[str, Any]]
+    MODEL: str = "gpt-5"
     token_counter: int
 
     _latest_tool_call_id: str = "call_12345"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.messages = []
         self.token_counter = 0
+        self._last_action_resp_id: Optional[str] = None
+        self._prev_resp_id: Optional[str] = None
 
     @property
     def name(self) -> str:
         obs = "with-observe" if self.DO_OBSERVATION else "no-observe"
         sanitized_model_name = self.MODEL.replace("/", "-").replace(":", "-")
         name = f"{super().name}.{sanitized_model_name}.{obs}"
-        if self.REASONING_EFFORT:
-            name += f".{self.REASONING_EFFORT}"
+        name += f".{self.REASONING_EFFORT}"
         return name
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -48,7 +46,7 @@ class LLM(Agent):
             [
                 latest_frame.state is GameState.WIN,
                 # uncomment below to only let the agent play one time
-                # latest_frame.state is GameState.GAME_OVER,
+                latest_frame.state is GameState.GAME_OVER,
             ]
         )
 
@@ -62,150 +60,162 @@ class LLM(Agent):
 
         client = OpenAIClient(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-        functions = self.build_functions()
         tools = self.build_tools()
 
-        # if latest_frame.state in [GameState.NOT_PLAYED]:
-        if len(self.messages) == 0:
-            # have to manually trigger the first reset to kick off agent
-            user_prompt = self.build_user_prompt(latest_frame)
-            message0 = {"role": "user", "content": user_prompt}
-            self.push_message(message0)
-            if self.MODEL_REQUIRES_TOOLS:
-                message1 = {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": self._latest_tool_call_id,
-                            "type": "function",
-                            "function": {
-                                "name": GameAction.RESET.name,
-                                "arguments": json.dumps({}),
-                            },
-                        }
-                    ],
-                }
-            else:
-                message1 = {
-                    "role": "assistant",
-                    "function_call": {"name": "RESET", "arguments": json.dumps({})},  # type: ignore
-                }
-            self.push_message(message1)
-            action = GameAction.RESET
-            return action
+        # on the very first turn force RESET to start the game
+        if self.action_counter == 0 and latest_frame.state is GameState.NOT_PLAYED:
+            return GameAction.RESET
 
         # let the agent comment observations before choosing action
         # on the first turn, this will be in response to RESET action
-        function_name = latest_frame.action_input.id.name
         function_response = self.build_func_resp_prompt(latest_frame)
-        if self.MODEL_REQUIRES_TOOLS:
-            message2 = {
-                "role": "tool",
-                "tool_call_id": self._latest_tool_call_id,
-                "content": str(function_response),
-            }
-        else:
-            message2 = {
-                "role": "function",
-                "name": function_name,
-                "content": str(function_response),
-            }
-        self.push_message(message2)
 
         if self.DO_OBSERVATION:
             logger.info("Sending to Assistant for observation...")
             try:
-                create_kwargs = {
-                    "model": self.MODEL,
-                    "messages": self.messages,
-                }
-                if self.REASONING_EFFORT is not None:
-                    create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
-                response = client.chat.completions.create(**create_kwargs)
+                # Prefer sending the previous tool result back as function_call_output tied to the last action's tool_call id
+                if (
+                    self._latest_tool_call_id
+                    and self._latest_tool_call_id != "call_12345"
+                    and self._last_action_resp_id
+                ):
+                    observation_input: ResponseInputParam = [
+                        {
+                            "type": "function_call_output",
+                            "call_id": self._latest_tool_call_id,
+                            "output": str(function_response),
+                        }
+                    ]
+                    create_kwargs: dict[str, Any] = {
+                        "model": self.MODEL,
+                        "input": observation_input,
+                        "previous_response_id": self._last_action_resp_id,
+                    }
+                else:
+                    # Fallback: simple observation text
+                    observation_input = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": str(function_response)}
+                            ],
+                        }
+                    ]
+                    create_kwargs = {
+                        "model": self.MODEL,
+                        "input": observation_input,
+                    }
+                create_kwargs["reasoning"] = {"effort": self.REASONING_EFFORT}
+                response = client.responses.create(**create_kwargs)
+                self._prev_resp_id = getattr(response, "id", None)
             except openai.BadRequestError as e:
-                logger.info(f"Message dump: {self.messages}")
-                raise e
-            self.track_tokens(
-                response.usage.total_tokens, response.choices[0].message.content
-            )
-            message3 = {
-                "role": "assistant",
-                "content": response.choices[0].message.content,
-            }
-            logger.info(f"Assistant: {response.choices[0].message.content}")
-            self.push_message(message3)
+                try:
+                    logger.info(
+                        "Observation request: %s",
+                        {
+                            "model": self.MODEL,
+                            "input": observation_input,
+                            "previous_response_id": self._last_action_resp_id,
+                            "reasoning": {"effort": self.REASONING_EFFORT},
+                        },
+                    )
+                finally:
+                    raise e
+            # Extract assistant text from Responses API
+            assistant_text = ""
+            try:
+                if getattr(response, "output_text", None):
+                    assistant_text = response.output_text or ""
+                else:
+                    for item in getattr(response, "output", []) or []:
+                        if getattr(item, "type", None) == "message":
+                            for elem in getattr(item, "content", []) or []:
+                                if getattr(
+                                    elem, "type", None
+                                ) == "output_text" and getattr(elem, "text", None):
+                                    assistant_text += elem.text or ""
+            except Exception:
+                assistant_text = ""
+
+            self.track_tokens(response.usage.total_tokens, assistant_text)
+            logger.info(f"Assistant: {assistant_text}")
 
         # now ask for the next action
         user_prompt = self.build_user_prompt(latest_frame)
-        message4 = {"role": "user", "content": user_prompt}
-        self.push_message(message4)
 
         name = GameAction.ACTION5.name  # default action if LLM doesnt call one
         arguments = None
-        message5 = None
 
-        if self.MODEL_REQUIRES_TOOLS:
-            logger.info("Sending to Assistant for action...")
-            try:
-                create_kwargs = {
-                    "model": self.MODEL,
-                    "messages": self.messages,
-                    "tools": tools,
-                    "tool_choice": "required",
+        # Use Responses API with tools for action selection
+        logger.info("Sending to Assistant for action...")
+        try:
+            # Build a minimal Responses input for action selection
+            action_input: ResponseInputParam = [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": str(user_prompt)}],
                 }
-                if self.REASONING_EFFORT is not None:
-                    create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
-                response = client.chat.completions.create(**create_kwargs)
-            except openai.BadRequestError as e:
-                logger.info(f"Message dump: {self.messages}")
-                raise e
-            self.track_tokens(response.usage.total_tokens)
-            message5 = response.choices[0].message
-            logger.debug(f"... got response {message5}")
-            tool_call = message5.tool_calls[0]
-            self._latest_tool_call_id = tool_call.id
-            logger.debug(
-                f"Assistant: {tool_call.function.name} ({tool_call.id}) {tool_call.function.arguments}"
-            )
-            name = tool_call.function.name
-            arguments = tool_call.function.arguments
-
-            # sometimes the model will call multiple tools which isnt allowed
-            extra_tools = message5.tool_calls[1:]
-            for tc in extra_tools:
-                logger.info(
-                    "Error: assistant called more than one action, only using the first."
+            ]
+            # If we have just had a tool call ID, include the function_call_output first
+            if self._latest_tool_call_id and self._latest_tool_call_id != "call_12345":
+                action_input.insert(
+                    0,
+                    {
+                        "type": "function_call_output",
+                        "call_id": self._latest_tool_call_id,
+                        "output": str(function_response),
+                    },
                 )
-                message_extra = {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": "Error: assistant can only call one action (tool) at a time. default to only the first chosen action.",
-                }
-                self.push_message(message_extra)
-        else:
-            logger.info("Sending to Assistant for action...")
+            create_kwargs = {
+                "model": self.MODEL,
+                "input": action_input,
+                "tools": tools,
+                "tool_choice": "required",
+            }
+            create_kwargs["reasoning"] = {"effort": self.REASONING_EFFORT}
+            if self._prev_resp_id:
+                create_kwargs["previous_response_id"] = self._prev_resp_id
+            response = client.responses.create(**create_kwargs)
+            self._prev_resp_id = getattr(response, "id", None)
+            self._last_action_resp_id = self._prev_resp_id
+        except openai.BadRequestError as e:
             try:
-                create_kwargs = {
-                    "model": self.MODEL,
-                    "messages": self.messages,
-                    "functions": functions,
-                    "function_call": "auto",
-                }
-                if self.REASONING_EFFORT is not None:
-                    create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
-                response = client.chat.completions.create(**create_kwargs)
-            except openai.BadRequestError as e:
-                logger.info(f"Message dump: {self.messages}")
+                logger.info(
+                    "Action request: %s",
+                    {
+                        "model": self.MODEL,
+                        "input": action_input,
+                        "tools": [t.get("name") for t in tools],
+                        "tool_choice": "required",
+                        "previous_response_id": self._prev_resp_id,
+                        "reasoning": {"effort": self.REASONING_EFFORT},
+                    },
+                )
+            finally:
                 raise e
-            self.track_tokens(response.usage.total_tokens)
-            message5 = response.choices[0].message
-            function_call = message5.function_call
-            logger.debug(f"Assistant: {function_call.name} {function_call.arguments}")
-            name = function_call.name
-            arguments = function_call.arguments
 
-        if message5:
-            self.push_message(message5)
+        # Track tokens (Responses API)
+        try:
+            self.track_tokens(response.usage.total_tokens)
+        except Exception:
+            pass
+
+        # Parse function call from Responses API
+        tool_call_item = None
+        for item in getattr(response, "output", []) or []:
+            if getattr(item, "type", None) == "function_call":
+                tool_call_item = item
+                break
+
+        if tool_call_item is not None:
+            self._latest_tool_call_id = getattr(tool_call_item, "call_id", "call_12345")
+            name = getattr(tool_call_item, "name", name)
+            arguments = getattr(tool_call_item, "arguments", arguments)
+            logger.debug(f"Assistant: {name} ({self._latest_tool_call_id}) {arguments}")
+        else:
+            logger.debug("No function_call found; defaulting to ACTION5")
+
+        # We no longer record assistant messages locally
         action_id = name
         if arguments:
             try:
@@ -242,100 +252,80 @@ class LLM(Agent):
         #         indent=2,
         #     )
 
-    def push_message(self, message: dict[str, Any]) -> list[dict[str, Any]]:
-        """Push a message onto stack, store up to MESSAGE_LIMIT with FIFO."""
-        self.messages.append(message)
-        if len(self.messages) > self.MESSAGE_LIMIT:
-            self.messages = self.messages[-self.MESSAGE_LIMIT :]
-        if self.MODEL_REQUIRES_TOOLS:
-            # cant clip the message list between tool
-            # and tool_call else llm will error
-            while (
-                self.messages[0].get("role")
-                if isinstance(self.messages[0], dict)
-                else getattr(self.messages[0], "role", None)
-            ) == "tool":
-                self.messages.pop(0)
-        return self.messages
-
-    def build_functions(self) -> list[dict[str, Any]]:
-        """Build JSON function description of game actions for LLM."""
+    def build_tools(self) -> list[dict[str, Any]]:
+        """Build Responses-native tool descriptors for game actions."""
         empty_params: dict[str, Any] = {
             "type": "object",
             "properties": {},
             "required": [],
             "additionalProperties": False,
         }
-        functions: list[dict[str, Any]] = [
+        action6_params: dict[str, Any] = {
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "string",
+                    "description": "Coordinate X which must be Int<0,63>",
+                },
+                "y": {
+                    "type": "string",
+                    "description": "Coordinate Y which must be Int<0,63>",
+                },
+            },
+            "required": ["x", "y"],
+            "additionalProperties": False,
+        }
+        return [
             {
+                "type": "function",
                 "name": GameAction.RESET.name,
                 "description": "Start or restart a game. Must be called first when NOT_PLAYED or after GAME_OVER to play again.",
                 "parameters": empty_params,
+                "strict": True,
             },
             {
+                "type": "function",
                 "name": GameAction.ACTION1.name,
                 "description": "Send this simple input action (1, W, Up).",
                 "parameters": empty_params,
+                "strict": True,
             },
             {
+                "type": "function",
                 "name": GameAction.ACTION2.name,
                 "description": "Send this simple input action (2, S, Down).",
                 "parameters": empty_params,
+                "strict": True,
             },
             {
+                "type": "function",
                 "name": GameAction.ACTION3.name,
                 "description": "Send this simple input action (3, A, Left).",
                 "parameters": empty_params,
+                "strict": True,
             },
             {
+                "type": "function",
                 "name": GameAction.ACTION4.name,
                 "description": "Send this simple input action (4, D, Right).",
                 "parameters": empty_params,
+                "strict": True,
             },
             {
+                "type": "function",
                 "name": GameAction.ACTION5.name,
                 "description": "Send this simple input action (5, Enter, Spacebar, Delete).",
                 "parameters": empty_params,
+                "strict": True,
             },
             {
+                "type": "function",
                 "name": GameAction.ACTION6.name,
                 "description": "Send this complex input action (6, Click, Point).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "x": {
-                            "type": "string",
-                            "description": "Coordinate X which must be Int<0,63>",
-                        },
-                        "y": {
-                            "type": "string",
-                            "description": "Coordinate Y which must be Int<0,63>",
-                        },
-                    },
-                    "required": ["x", "y"],
-                    "additionalProperties": False,
-                },
+                "parameters": action6_params,
+                "strict": True,
             },
         ]
-        return functions
-
-    def build_tools(self) -> list[dict[str, Any]]:
-        """Support models that expect tool_call format."""
-        functions = self.build_functions()
-        tools: list[dict[str, Any]] = []
-        for f in functions:
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": f["name"],
-                        "description": f["description"],
-                        "parameters": f.get("parameters", {}),
-                        "strict": True,
-                    },
-                }
-            )
-        return tools
 
     def build_func_resp_prompt(self, latest_frame: FrameData) -> str:
         return textwrap.dedent(
@@ -389,9 +379,7 @@ Call exactly one action.
             if hasattr(self, "recorder") and not self.is_playback:
                 meta = {
                     "llm_user_prompt": self.build_user_prompt(self.frames[-1]),
-                    "llm_tools": self.build_tools()
-                    if self.MODEL_REQUIRES_TOOLS
-                    else self.build_functions(),
+                    "llm_tools": self.build_tools(),
                     "llm_tool_resp_prompt": self.build_func_resp_prompt(
                         self.frames[-1]
                     ),
@@ -403,10 +391,9 @@ Call exactly one action.
 class ReasoningLLM(LLM, Agent):
     """An LLM agent that uses o4-mini and captures reasoning metadata in the action.reasoning field."""
 
-    MAX_ACTIONS = 80
+    MAX_ACTIONS = 5
     DO_OBSERVATION = True
-    MODEL_REQUIRES_TOOLS = True
-    MODEL = "o4-mini"
+    MODEL = "gpt-5"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -451,22 +438,20 @@ class ReasoningLLM(LLM, Agent):
         self._total_reasoning_tokens += tokens
 
     def capture_reasoning_from_response(self, response: Any) -> None:
-        """Helper method to capture reasoning tokens from OpenAI API response.
-
-        This should be called from the parent class if we have access to the raw response.
-        For reasoning models, reasoning tokens are in response.usage.completion_tokens_details.reasoning_tokens
-        """
-        if hasattr(response, "usage") and hasattr(
-            response.usage, "completion_tokens_details"
-        ):
-            if hasattr(response.usage.completion_tokens_details, "reasoning_tokens"):
+        """Capture reasoning tokens from Responses API usage if available."""
+        try:
+            # Prefer Responses API field
+            if (
+                hasattr(response, "usage")
+                and hasattr(response.usage, "output_tokens_details")
+                and hasattr(response.usage.output_tokens_details, "reasoning_tokens")
+            ):
                 self._last_reasoning_tokens = (
-                    response.usage.completion_tokens_details.reasoning_tokens
+                    response.usage.output_tokens_details.reasoning_tokens or 0
                 )
                 self._total_reasoning_tokens += self._last_reasoning_tokens
-                logger.debug(
-                    f"Captured {self._last_reasoning_tokens} reasoning tokens from {self.MODEL} response"
-                )
+        except Exception:
+            pass
 
 
 class FastLLM(LLM, Agent):
@@ -499,7 +484,6 @@ class GuidedLLM(LLM, Agent):
     MAX_ACTIONS = 80
     DO_OBSERVATION = True
     MODEL = "o3"
-    MODEL_REQUIRES_TOOLS = True
     MESSAGE_LIMIT = 10
     REASONING_EFFORT = "high"
 
@@ -549,22 +533,18 @@ class GuidedLLM(LLM, Agent):
         self._total_reasoning_tokens += tokens
 
     def capture_reasoning_from_response(self, response: Any) -> None:
-        """Helper method to capture reasoning tokens from OpenAI API response.
-
-        This should be called from the parent class if we have access to the raw response.
-        For o3 models, reasoning tokens are in response.usage.completion_tokens_details.reasoning_tokens
-        """
-        if hasattr(response, "usage") and hasattr(
-            response.usage, "completion_tokens_details"
-        ):
-            if hasattr(response.usage.completion_tokens_details, "reasoning_tokens"):
+        try:
+            if (
+                hasattr(response, "usage")
+                and hasattr(response.usage, "output_tokens_details")
+                and hasattr(response.usage.output_tokens_details, "reasoning_tokens")
+            ):
                 self._last_reasoning_tokens = (
-                    response.usage.completion_tokens_details.reasoning_tokens
+                    response.usage.output_tokens_details.reasoning_tokens or 0
                 )
                 self._total_reasoning_tokens += self._last_reasoning_tokens
-                logger.debug(
-                    f"Captured {self._last_reasoning_tokens} reasoning tokens from o3 response"
-                )
+        except Exception:
+            pass
 
     def build_user_prompt(self, latest_frame: FrameData) -> str:
         return textwrap.dedent(
