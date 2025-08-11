@@ -11,6 +11,10 @@ from pydantic import BaseModel, Field
 
 from ..structs import FrameData, GameAction
 from .llm_agents import ReasoningLLM
+from .prompts import (
+    build_reasoning_user_text,
+    get_reasoning_agent_developer_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +49,6 @@ class ReasoningAgent(ReasoningLLM):
     """A reasoning agent that tracks screen history and builds hypotheses about game rules."""
 
     MAX_ACTIONS = 400
-    DO_OBSERVATION = True
     MODEL = "gpt-5"
     MESSAGE_LIMIT = 5
     REASONING_EFFORT = "high"
@@ -54,7 +57,7 @@ class ReasoningAgent(ReasoningLLM):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.history: List[ReasoningActionResponse] = []
-        self.screen_history: List[bytes] = []
+        self.screen_history: List[str] = []
         self.max_screen_history = 10  # Limit screen history to prevent memory leak
         self.client = OpenAI()
 
@@ -65,14 +68,14 @@ class ReasoningAgent(ReasoningLLM):
 
     def generate_grid_image_with_zone(
         self, grid: List[List[int]], cell_size: int = 40
-    ) -> bytes:
+    ) -> str:
         """Generate PIL image of the grid with colored cells and zone coordinates."""
         if not grid or not grid[0]:
             # Create empty image
             img = Image.new("RGB", (200, 200), color="black")
             buffer = io.BytesIO()
             img.save(buffer, format="PNG")
-            return buffer.getvalue()
+            return base64.b64encode(buffer.getvalue()).decode()
 
         height = len(grid)
         width = len(grid[0])
@@ -155,7 +158,7 @@ class ReasoningAgent(ReasoningLLM):
         # Convert to bytes
         buffer = io.BytesIO()
         img.save(buffer, format="PNG")
-        return buffer.getvalue()
+        return base64.b64encode(buffer.getvalue()).decode()
 
     def build_tools(self) -> list[dict[str, Any]]:
         """Build Responses-native tool descriptors with ReasoningActionResponse schema."""
@@ -242,8 +245,7 @@ Hint:
 
             # Token and reasoning tracking (Responses API)
             assistant_text = getattr(response, "output_text", None) or ""
-            self.track_tokens(response.usage.total_tokens, assistant_text)
-            self.capture_reasoning_from_response(response)
+            self.track_tokens(response.usage, assistant_text)
 
             # Find first function_call
             tool_call_item = None
@@ -269,10 +271,10 @@ Hint:
         """Define next action for the reasoning agent."""
         # Generate map image
         current_grid = latest_frame.frame[-1] if latest_frame.frame else []
-        map_image = self.generate_grid_image_with_zone(current_grid)
+        current_image_b64 = self.generate_grid_image_with_zone(current_grid)
 
         # Build messages
-        system_prompt = self.build_user_prompt(latest_frame)
+        system_prompt = get_reasoning_agent_developer_prompt()
 
         # Get latest action from history
         latest_action = self.history[-1] if self.history else None
@@ -289,15 +291,17 @@ Hint:
                     {"type": "input_text", "text": "Previous screen:"},
                     {
                         "type": "input_image",
-                        "image_url": f"data:image/png;base64,{base64.b64encode(previous_screen).decode()}",
+                        "image_url": f"data:image/png;base64,{previous_screen}",
                     },
                 ]
             )
 
         raw_grid_text = self.pretty_print_3d(latest_frame.frame)
-        user_message_text = f"Your previous action was: {json.dumps(latest_action.model_dump() if latest_action else None, indent=2)}\n\nAttached are the visual screen and raw grid data.\n\nRaw Grid:\n{raw_grid_text}\n\nWhat should you do next?"
+        user_message_text = build_reasoning_user_text(
+            json.dumps(latest_action.model_dump() if latest_action else None, indent=2),
+            raw_grid_text,
+        )
 
-        current_image_b64 = base64.b64encode(map_image).decode()
         user_message_content.extend(
             [
                 {"type": "input_text", "text": user_message_text},
@@ -321,7 +325,7 @@ Hint:
         result = self.call_llm_with_structured_output(messages)
 
         # Store current screen for next iteration (after using it)
-        self.screen_history.append(map_image)
+        self.screen_history.append(current_image_b64)
         if len(self.screen_history) > self.max_screen_history:
             self.screen_history.pop(0)
 
@@ -355,6 +359,13 @@ Hint:
         action = GameAction.from_name(action_response.name)
 
         # Create and attach reasoning metadata
+        # Include preamble and reasoning preview consistent with ReasoningLLM
+        reasoning_preview = (
+            (self._last_reasoning_text[:200] + "...")
+            if hasattr(self, "_last_reasoning_text")
+            and len(self._last_reasoning_text) > 200
+            else getattr(self, "_last_reasoning_text", "")
+        )
         reasoning_meta = {
             "model": self.MODEL,
             "reasoning_effort": self.REASONING_EFFORT,
@@ -363,9 +374,13 @@ Hint:
             "agent_type": "reasoning_agent",
             "hypothesis": action_response.hypothesis,
             "aggregated_findings": action_response.aggregated_findings,
-            "response_preview": action_response.reason[:200] + "..."
-            if len(action_response.reason) > 200
-            else action_response.reason,
+            "preamble": getattr(self, "_last_preamble", ""),
+            "reasoning_preview": reasoning_preview
+            or (
+                action_response.reason[:200] + "..."
+                if len(action_response.reason) > 200
+                else action_response.reason
+            ),
             "action_chosen": action.name,
             "game_context": {
                 "score": latest_frame.score,
