@@ -177,7 +177,7 @@ def main() -> None:
         tags.extend(user_tags)
 
     # Initialize AgentOps client
-    init_agentops(api_key=os.getenv("AGENTOPS_API_KEY"), log_level=log_level)
+    init_agentops(api_key=os.getenv("AGENTOPS_API_KEY"), log_level=log_level, auto_start_session=False)
 
     swarm = Swarm(
         args.agent,

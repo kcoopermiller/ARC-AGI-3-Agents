@@ -20,6 +20,14 @@ from .prompts import (
 
 logger = logging.getLogger()
 
+# Import AgentOps for manual tracing
+try:
+    import agentops
+    AGENTOPS_AVAILABLE = True
+except ImportError:
+    AGENTOPS_AVAILABLE = False
+    logger.warning("AgentOps not available - tracing will be disabled")
+
 
 class LLM(Agent):
     """An agent that uses a base LLM model to play games."""
@@ -33,6 +41,9 @@ class LLM(Agent):
     current_thread_tokens: int
 
     _latest_tool_call_id: str = "call_placeholder"
+    
+    # AgentOps tracing
+    agentops_trace: Optional[Any] = None
 
     # Compacting / handoff
     running_summary: str = ""
@@ -44,6 +55,18 @@ class LLM(Agent):
         self.token_counter = 0
         self.current_thread_tokens = 0
         self._prev_resp_id: Optional[str] = None
+        self.agentops_trace = None
+        
+        # Initialize AgentOps trace if available and not already initialized
+        if AGENTOPS_AVAILABLE and hasattr(agentops, 'is_initialized') and agentops.is_initialized():
+            try:
+                self.agentops_trace = agentops.start_trace(
+                    trace_name=f"arc-{self.game_id}-{self.name}",
+                    tags=(self.tags or []) + ["responses-api", self.MODEL, "arc-agi"]
+                )
+                logger.info(f"Started AgentOps trace for {self.name}")
+            except Exception as e:
+                logger.warning(f"Failed to start AgentOps trace: {e}")
 
     @property
     def name(self) -> str:
@@ -51,6 +74,21 @@ class LLM(Agent):
         name = f"{super().name}.{sanitized_model_name}"
         name += f".{self.REASONING_EFFORT}"
         return name
+
+    def _log_to_agentops(self, event_type: str, data: dict[str, Any]) -> None:
+        """Log events to AgentOps if available."""
+        if self.agentops_trace and AGENTOPS_AVAILABLE:
+            try:
+                # Record the action to AgentOps
+                agentops.record_action({
+                    "action_type": event_type,
+                    "agent_name": self.name,
+                    "game_id": self.game_id,
+                    "action_counter": self.action_counter,
+                    **data
+                })
+            except Exception as e:
+                logger.debug(f"Failed to log to AgentOps: {e}")
 
     def _responses_create(
         self,
@@ -66,7 +104,16 @@ class LLM(Agent):
         max_output_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> Response:
-        """Queries the LLM with the given parameters."""
+        """Queries the LLM with the given parameters and logs to AgentOps."""
+        
+        # Log request to AgentOps
+        self._log_to_agentops("llm_request_start", {
+            "model": self.MODEL,
+            "has_tools": tools is not None,
+            "has_images": image_base64 is not None or function_call_output is not None,
+            "reasoning_effort": reasoning_effort or self.REASONING_EFFORT,
+            "previous_response_id": previous_response_id,
+        })
         input_items: ResponseInputParam = []
         if function_call_output is not None:
             call_id, output_str, grid_base64 = function_call_output
@@ -126,7 +173,29 @@ class LLM(Agent):
         if max_output_tokens is not None:
             create_kwargs["max_output_tokens"] = max_output_tokens
 
-        return client.responses.create(**create_kwargs)
+        try:
+            response = client.responses.create(**create_kwargs)
+            
+            # Log successful response to AgentOps
+            self._log_to_agentops("llm_response", {
+                "response_id": response.id,
+                "model": response.model,
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+                "cached_tokens": response.usage.input_tokens_details.cached_tokens,
+                "reasoning_tokens": getattr(response.usage.output_tokens_details, 'reasoning_tokens', 0),
+            })
+            
+            return response
+            
+        except Exception as e:
+            # Log error to AgentOps
+            self._log_to_agentops("llm_error", {
+                "error": str(e),
+                "error_type": type(e).__name__,
+            })
+            raise
 
     def generate_grid_image_with_zone(
         self, grid: List[List[int]], cell_size: int = 40
@@ -283,6 +352,13 @@ class LLM(Agent):
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
         """Choose which action the Agent should take, fill in any arguments, and return it."""
+        
+        # Log action start to AgentOps
+        self._log_to_agentops("action_start", {
+            "action_counter": self.action_counter,
+            "game_state": latest_frame.state.name,
+            "score": latest_frame.score,
+        })
 
         logging.getLogger("openai").setLevel(logging.CRITICAL)
         logging.getLogger("httpx").setLevel(logging.CRITICAL)
@@ -293,7 +369,12 @@ class LLM(Agent):
 
         # on the very first turn force RESET to start the game
         if self.action_counter == 0 and latest_frame.state is GameState.NOT_PLAYED:
-            return GameAction.RESET
+            action = GameAction.RESET
+            self._log_to_agentops("action_chosen", {
+                "action": action.name,
+                "reason": "initial_reset"
+            })
+            return action
 
         current_grid = latest_frame.frame[-1] if latest_frame.frame else []
         grid_base64 = self.generate_grid_image_with_zone(current_grid)
@@ -356,6 +437,7 @@ class LLM(Agent):
                     (self._latest_tool_call_id, function_response, grid_base64),
                 )
             else:
+                self._log_to_agentops("openai_error", {"error": str(e)})
                 raise e
 
         preamble_text = ""
@@ -399,6 +481,14 @@ class LLM(Agent):
 
         action = GameAction.from_name(action_id)
         action.set_data(data)
+        
+        # Log final action choice to AgentOps
+        self._log_to_agentops("action_chosen", {
+            "action": action.name,
+            "action_data": data,
+            "tool_call_id": self._latest_tool_call_id,
+        })
+        
         return action
 
     def track_tokens(
@@ -511,7 +601,17 @@ class LLM(Agent):
         return "\n".join(lines)
 
     def cleanup(self, *args: Any, **kwargs: Any) -> None:
+        """Cleanup and end AgentOps trace."""
         if self._cleanup:
+            # End AgentOps trace
+            if self.agentops_trace and AGENTOPS_AVAILABLE:
+                try:
+                    end_state = "Success" if self.frames[-1].state == GameState.WIN else "Completed"
+                    agentops.end_trace(self.agentops_trace, end_state=end_state)
+                    logger.info(f"Ended AgentOps trace for {self.name} with state: {end_state}")
+                except Exception as e:
+                    logger.warning(f"Failed to end AgentOps trace: {e}")
+            
             if hasattr(self, "recorder") and not self.is_playback:
                 meta = {
                     "llm_tools": self.build_tools(),
