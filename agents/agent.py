@@ -71,7 +71,6 @@ class Agent(ABC):
         self._session.cookies = deepcopy(cookies)
         self._session.headers.update(self.headers)
 
-    @trace_agent_session
     def main(self) -> None:
         """The main agent loop. Play the game_id until finished, then exits."""
         self.timer = time.time()

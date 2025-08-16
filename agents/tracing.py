@@ -48,16 +48,13 @@ except ImportError:
 
 
 def initialize(
-    api_key: Optional[str] = None, 
-    log_level: Optional[int] = logging.INFO,
-    auto_start_session: bool = True
+    api_key: Optional[str] = None, log_level: Optional[int] = logging.INFO
 ) -> None:
     """Initialize the AgentOps SDK with an optional API key.
 
     Args:
         api_key: Optional AgentOps API key
         log_level: Optional log level for AgentOps
-        auto_start_session: Whether to auto-start sessions (False for Responses API)
     """
     global is_initialized
 
@@ -75,7 +72,7 @@ def initialize(
     try:
         agentops_client.init(
             api_key=api_key,
-            auto_start_session=auto_start_session,
+            auto_start_session=False,
             log_level=log_level,
         )
         is_initialized = True

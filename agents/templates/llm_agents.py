@@ -20,15 +20,20 @@ from .prompts import (
 
 logger = logging.getLogger()
 
-# Import AgentOps for manual tracing
+# Import AgentOps for @agent decorator
 try:
     import agentops
+    from agentops.sdk.decorators import agent
     AGENTOPS_AVAILABLE = True
 except ImportError:
     AGENTOPS_AVAILABLE = False
     logger.warning("AgentOps not available - tracing will be disabled")
+    # Create a no-op decorator if AgentOps is not available
+    def agent(cls):
+        return cls
 
 
+@agent
 class LLM(Agent):
     """An agent that uses a base LLM model to play games."""
 
@@ -41,9 +46,6 @@ class LLM(Agent):
     current_thread_tokens: int
 
     _latest_tool_call_id: str = "call_placeholder"
-    
-    # AgentOps tracing
-    agentops_trace: Optional[Any] = None
 
     # Compacting / handoff
     running_summary: str = ""
@@ -55,18 +57,6 @@ class LLM(Agent):
         self.token_counter = 0
         self.current_thread_tokens = 0
         self._prev_resp_id: Optional[str] = None
-        self.agentops_trace = None
-        
-        # Initialize AgentOps trace if available and not already initialized
-        if AGENTOPS_AVAILABLE and hasattr(agentops, 'is_initialized') and agentops.is_initialized():
-            try:
-                self.agentops_trace = agentops.start_trace(
-                    trace_name=f"arc-{self.game_id}-{self.name}",
-                    tags=(self.tags or []) + ["responses-api", self.MODEL, "arc-agi"]
-                )
-                logger.info(f"Started AgentOps trace for {self.name}")
-            except Exception as e:
-                logger.warning(f"Failed to start AgentOps trace: {e}")
 
     @property
     def name(self) -> str:
@@ -77,7 +67,7 @@ class LLM(Agent):
 
     def _log_to_agentops(self, event_type: str, data: dict[str, Any]) -> None:
         """Log events to AgentOps if available."""
-        if self.agentops_trace and AGENTOPS_AVAILABLE:
+        if AGENTOPS_AVAILABLE:
             try:
                 # Record the action to AgentOps
                 agentops.record_action({
@@ -601,17 +591,7 @@ class LLM(Agent):
         return "\n".join(lines)
 
     def cleanup(self, *args: Any, **kwargs: Any) -> None:
-        """Cleanup and end AgentOps trace."""
         if self._cleanup:
-            # End AgentOps trace
-            if self.agentops_trace and AGENTOPS_AVAILABLE:
-                try:
-                    end_state = "Success" if self.frames[-1].state == GameState.WIN else "Completed"
-                    agentops.end_trace(self.agentops_trace, end_state=end_state)
-                    logger.info(f"Ended AgentOps trace for {self.name} with state: {end_state}")
-                except Exception as e:
-                    logger.warning(f"Failed to end AgentOps trace: {e}")
-            
             if hasattr(self, "recorder") and not self.is_playback:
                 meta = {
                     "llm_tools": self.build_tools(),
@@ -626,6 +606,7 @@ class LLM(Agent):
         super().cleanup(*args, **kwargs)
 
 
+@agent
 class ReasoningLLM(LLM, Agent):
     """An LLM agent that uses o4-mini and captures reasoning metadata in the action.reasoning field."""
 
