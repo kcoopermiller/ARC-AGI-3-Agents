@@ -1,4 +1,5 @@
 import textwrap
+from typing import Optional
 
 
 def get_developer_prompt() -> str:
@@ -12,6 +13,7 @@ def get_developer_prompt() -> str:
         • `RESET` - start or restart the game state.  
         • `ACTION1` to `ACTION5` - simple actions whose meaning varies by game (e.g., movement or interaction).  
         • `ACTION6` - a complex action that requires a pair of `x y` coordinates (each between 0 and 63).
+        • `OBSERVE` - a thinking tool to jot a brief note for yourself; may be called multiple times before choosing an action.
 
         At each step the game supplies metadata listing which actions are currently valid; always restrict your choices to the available actions. When you choose `ACTION6`, you must include the coordinates explicitly. Invalid or malformed outputs will terminate the game.
 
@@ -25,8 +27,7 @@ def get_developer_prompt() -> str:
         </agent_overview>
 
         <game_state_understanding>
-        - On each turn you receive a structured environment snapshot containing the grid and metadata (score, step count, available actions, game state).
-        - In addition, a rendered image of the current grid is attached as a user message. Use the image to aid spatial reasoning, pattern recognition, and to verify coordinates (especially when selecting `ACTION6`).
+        - On each turn you receive a structured environment snapshot containing metadata described below in <function_call_output> and a rendered image of the current grid is attached as a user message. Use the image to aid spatial reasoning, pattern recognition, and to verify coordinates (especially when selecting `ACTION6`).
         - Parse the grid into an internal representation. Track the position of entities, obstacles, movable pieces, scores and other attributes.
         - Use the coordinate system (0,0 top-left) and integer cell values (0-15) to identify patterns (e.g., different colors or objects).
         - Store observations about what happens when you take each action (e.g., how objects move, how the score changes). Use this to infer the rules of the game.
@@ -64,20 +65,20 @@ def get_developer_prompt() -> str:
         - Only end the game or stop acting when the objective has been achieved or no valid actions remain.
         </persistence>
 
-        <tool_preambles>
-        - Before invoking any tool call on each turn, emit a brief "tool preamble" message to help observers follow your reasoning and plan.
-        - Keep it concise (1-3 sentences). Structure:
-          1) Rephrase the current objective based on the latest environment snapshot.
-          2) State the immediate plan and the single action you will try next (and why it's appropriate).
-          3) If not the first turn, briefly note what changed since the last action.
-        - After emitting the preamble, immediately invoke exactly one tool call to take the action.
-        </tool_preambles>
-
         <response_formatting>
-        - After reasoning, output exactly one action string from the set {RESET, ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6}.
-        - Make sure to always output an action string. If you do not, the game will default to ACTION5 which could alter the game state.
+        - You may first call `OBSERVE(note=...)` one or more times to collect thoughts; keep notes short and focused on what to test next.
+        - Then, output exactly one game action tool call from {RESET, ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6}.
+        - Make sure to always output a game action tool call eventually; if you do not, the game will default to ACTION5 which could alter the state.
         - If you choose `ACTION6`, include two integer coordinates (0-63).
         </response_formatting>
+
+        <function_call_output>
+        - After each tool call, the environment snapshot will include structured tags:
+          - <action>… COMPLETED</action>: indicates the named action was executed.
+          - <environment_change>YES/NO (changed_cells=N)</environment_change>: indicates whether the visible grid changed compared to the previous frame, with an optional count of changed cells.
+        - IMPORTANT: A value of NO does not necessarily mean the action was a no-op or irrelevant. Examples include attempting to move into a wall, interacting with a non-interactive tile, or providing incorrect coordinates for a click.
+        - Use these signals in combination with the attached image and your internal model. Fully understand how each action works in the current game before ruling it out as not relevant.
+        </function_call_output>
 
         By following these guidelines, you will efficiently explore ARC-AGI-3 game environments, infer their rules, and select appropriate actions to achieve high performance.
         """
@@ -208,16 +209,29 @@ def build_function_call_output_text(
     *,
     state: str,
     score: int,
-    grid: str,
+    grid: Optional[str] = None,
+    action_name: Optional[str] = None,
+    env_changed: Optional[bool] = None,
+    changed_cells: Optional[int] = None,
 ) -> str:
+    grid_block = f"\n<grid>\n{grid}\n</grid>" if grid is not None else ""
+    action_block = (
+        f"\n<action>{action_name} COMPLETED</action>" if action_name is not None else ""
+    )
+    change_block = ""
+    if env_changed is not None:
+        status = "YES" if env_changed else "NO"
+        details = (
+            f" (changed_cells={changed_cells})" if changed_cells is not None else ""
+        )
+        change_block = f"\n<environment_change>{status}{details}</environment_change>"
     return textwrap.dedent(
         f"""
         <environment_snapshot>
+        {action_block}
+        {change_block}
         <state>{state}</state>
-        <score>{score}</score>
-        <grid>
-        {grid}
-        </grid>
+        <score>{score}</score>{grid_block}
         </environment_snapshot>
         """
     ).strip()
