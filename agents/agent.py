@@ -8,13 +8,13 @@ from typing import Any, Optional
 
 import requests
 import requests.cookies
+from langfuse import observe
 from pydantic import ValidationError
 from requests import Response
 from requests.cookies import RequestsCookieJar
 
 from .recorder import Recorder
 from .structs import FrameData, GameAction, GameState, Scorecard
-from .tracing import trace_agent_session
 
 logger = logging.getLogger()
 
@@ -71,7 +71,7 @@ class Agent(ABC):
         self._session.cookies = deepcopy(cookies)
         self._session.headers.update(self.headers)
 
-    @trace_agent_session
+    @observe(name="ARC-AGI-3")  # type: ignore
     def main(self) -> None:
         """The main agent loop. Play the game_id until finished, then exits."""
         self.timer = time.time()
@@ -82,8 +82,13 @@ class Agent(ABC):
             action = self.choose_action(self.frames, self.frames[-1])
             if frame := self.take_action(action):
                 self.append_frame(frame)
+                coord_str = ""
+                if action.is_complex():
+                    x = getattr(action.action_data, "x", None)
+                    y = getattr(action.action_data, "y", None)
+                    coord_str = f", x {x}, y {y}"
                 logger.info(
-                    f"{self.game_id} - {action.name}: count {self.action_counter}, score {frame.score}, avg fps {self.fps})"
+                    f"{self.game_id} - {action.name}{coord_str}: count {self.action_counter}, score {frame.score}, avg fps {self.fps})"
                 )
             self.action_counter += 1
 

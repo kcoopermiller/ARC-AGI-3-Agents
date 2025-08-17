@@ -11,6 +11,10 @@ from pydantic import BaseModel, Field
 
 from ..structs import FrameData, GameAction
 from .llm_agents import ReasoningLLM
+from .prompts import (
+    build_reasoning_user_text,
+    get_reasoning_agent_developer_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +49,7 @@ class ReasoningAgent(ReasoningLLM):
     """A reasoning agent that tracks screen history and builds hypotheses about game rules."""
 
     MAX_ACTIONS = 400
-    DO_OBSERVATION = True
-    MODEL = "o4-mini"
+    MODEL = "gpt-5"
     MESSAGE_LIMIT = 5
     REASONING_EFFORT = "high"
     ZONE_SIZE = 16
@@ -54,7 +57,7 @@ class ReasoningAgent(ReasoningLLM):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.history: List[ReasoningActionResponse] = []
-        self.screen_history: List[bytes] = []
+        self.screen_history: List[str] = []
         self.max_screen_history = 10  # Limit screen history to prevent memory leak
         self.client = OpenAI()
 
@@ -65,14 +68,14 @@ class ReasoningAgent(ReasoningLLM):
 
     def generate_grid_image_with_zone(
         self, grid: List[List[int]], cell_size: int = 40
-    ) -> bytes:
+    ) -> str:
         """Generate PIL image of the grid with colored cells and zone coordinates."""
         if not grid or not grid[0]:
             # Create empty image
             img = Image.new("RGB", (200, 200), color="black")
             buffer = io.BytesIO()
             img.save(buffer, format="PNG")
-            return buffer.getvalue()
+            return base64.b64encode(buffer.getvalue()).decode()
 
         height = len(grid)
         width = len(grid[0])
@@ -155,18 +158,17 @@ class ReasoningAgent(ReasoningLLM):
         # Convert to bytes
         buffer = io.BytesIO()
         img.save(buffer, format="PNG")
-        return buffer.getvalue()
+        return base64.b64encode(buffer.getvalue()).decode()
 
-    def build_functions(self) -> list[dict[str, Any]]:
-        """Build JSON function description of game actions for LLM."""
+    def build_tools(self) -> list[dict[str, Any]]:
+        """Build Responses-native tool descriptors with ReasoningActionResponse schema."""
         schema = ReasoningActionResponse.model_json_schema()
-        # The 'name' property is the action to be taken, so we can remove it from the parameters.
         schema["properties"].pop("name", None)
-        if "required" in schema:
+        if "required" in schema and "name" in schema["required"]:
             schema["required"].remove("name")
-
-        functions: list[dict[str, Any]] = [
+        return [
             {
+                "type": "function",
                 "name": action.name,
                 "description": f"Take action {action.name}",
                 "parameters": schema,
@@ -179,24 +181,6 @@ class ReasoningAgent(ReasoningLLM):
                 GameAction.RESET,
             ]
         ]
-        return functions
-
-    def build_tools(self) -> list[dict[str, Any]]:
-        """Support models that expect tool_call format."""
-        functions = self.build_functions()
-        tools: list[dict[str, Any]] = []
-        for f in functions:
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": f["name"],
-                        "description": f["description"],
-                        "parameters": f.get("parameters", {}),
-                    },
-                }
-            )
-        return tools
 
     def build_user_prompt(self, latest_frame: FrameData) -> str:
         """Build the user prompt for hypothesis-driven exploration."""
@@ -249,29 +233,35 @@ Hint:
     ) -> ReasoningActionResponse:
         """Call LLM with structured output parsing for reasoning agent."""
         try:
-            tools = self.build_tools()
-
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.MODEL,
-                messages=messages,
-                tools=tools,
+                input=messages,
+                tools=self.build_tools(),
                 tool_choice="required",
+                reasoning={"effort": getattr(self, "REASONING_EFFORT", None)}
+                if getattr(self, "REASONING_EFFORT", None)
+                else None,
             )
 
-            self.track_tokens(
-                response.usage.total_tokens, response.choices[0].message.content
-            )
-            self.capture_reasoning_from_response(response)
+            # Token and reasoning tracking (Responses API)
+            assistant_text = getattr(response, "output_text", None) or ""
+            self.track_tokens(response.usage, assistant_text)
 
-            response_message = response.choices[0].message
-            tool_calls = response_message.tool_calls
-            if tool_calls:
-                tool_call = tool_calls[0]
-                function_args = json.loads(tool_call.function.arguments)
-                function_args["name"] = tool_call.function.name
-                return ReasoningActionResponse(**function_args)
+            # Find first function_call
+            tool_call_item = None
+            for item in getattr(response, "output", []) or []:
+                if getattr(item, "type", None) == "function_call":
+                    tool_call_item = item
+                    break
 
-            raise ValueError("LLM did not return a tool call.")
+            if tool_call_item is None:
+                raise ValueError("LLM did not return a tool call.")
+
+            arguments_json = getattr(tool_call_item, "arguments", "{}")
+            name = getattr(tool_call_item, "name", "RESET")
+            function_args = json.loads(arguments_json or "{}")
+            function_args["name"] = name
+            return ReasoningActionResponse(**function_args)
 
         except Exception as e:
             logger.error(f"LLM structured call failed: {e}")
@@ -281,10 +271,10 @@ Hint:
         """Define next action for the reasoning agent."""
         # Generate map image
         current_grid = latest_frame.frame[-1] if latest_frame.frame else []
-        map_image = self.generate_grid_image_with_zone(current_grid)
+        current_image_b64 = self.generate_grid_image_with_zone(current_grid)
 
         # Build messages
-        system_prompt = self.build_user_prompt(latest_frame)
+        system_prompt = get_reasoning_agent_developer_prompt()
 
         # Get latest action from history
         latest_action = self.history[-1] if self.history else None
@@ -298,37 +288,36 @@ Hint:
         if previous_screen:
             user_message_content.extend(
                 [
-                    {"type": "text", "text": "Previous screen:"},
+                    {"type": "input_text", "text": "Previous screen:"},
                     {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{base64.b64encode(previous_screen).decode()}",
-                            "detail": "high",
-                        },
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{previous_screen}",
                     },
                 ]
             )
 
         raw_grid_text = self.pretty_print_3d(latest_frame.frame)
-        user_message_text = f"Your previous action was: {json.dumps(latest_action.model_dump() if latest_action else None, indent=2)}\n\nAttached are the visual screen and raw grid data.\n\nRaw Grid:\n{raw_grid_text}\n\nWhat should you do next?"
+        user_message_text = build_reasoning_user_text(
+            json.dumps(latest_action.model_dump() if latest_action else None, indent=2),
+            raw_grid_text,
+        )
 
-        current_image_b64 = base64.b64encode(map_image).decode()
         user_message_content.extend(
             [
-                {"type": "text", "text": user_message_text},
+                {"type": "input_text", "text": user_message_text},
                 {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{current_image_b64}",
-                        "detail": "high",
-                    },
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{current_image_b64}",
                 },
             ]
         )
 
         # Build messages
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
             {"role": "user", "content": user_message_content},
         ]
 
@@ -336,7 +325,7 @@ Hint:
         result = self.call_llm_with_structured_output(messages)
 
         # Store current screen for next iteration (after using it)
-        self.screen_history.append(map_image)
+        self.screen_history.append(current_image_b64)
         if len(self.screen_history) > self.max_screen_history:
             self.screen_history.pop(0)
 
@@ -370,6 +359,13 @@ Hint:
         action = GameAction.from_name(action_response.name)
 
         # Create and attach reasoning metadata
+        # Include preamble and reasoning preview consistent with ReasoningLLM
+        reasoning_preview = (
+            (self._last_reasoning_text[:200] + "...")
+            if hasattr(self, "_last_reasoning_text")
+            and len(self._last_reasoning_text) > 200
+            else getattr(self, "_last_reasoning_text", "")
+        )
         reasoning_meta = {
             "model": self.MODEL,
             "reasoning_effort": self.REASONING_EFFORT,
@@ -378,9 +374,13 @@ Hint:
             "agent_type": "reasoning_agent",
             "hypothesis": action_response.hypothesis,
             "aggregated_findings": action_response.aggregated_findings,
-            "response_preview": action_response.reason[:200] + "..."
-            if len(action_response.reason) > 200
-            else action_response.reason,
+            "preamble": getattr(self, "_last_preamble", ""),
+            "reasoning_preview": reasoning_preview
+            or (
+                action_response.reason[:200] + "..."
+                if len(action_response.reason) > 200
+                else action_response.reason
+            ),
             "action_chosen": action.name,
             "game_context": {
                 "score": latest_frame.score,
